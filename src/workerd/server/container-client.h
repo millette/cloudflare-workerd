@@ -88,6 +88,7 @@ class ContainerClient final: public rpc::Container::Server, public kj::Refcounte
   kj::Promise<void> snapshotDirectory(SnapshotDirectoryContext context) override;
   kj::Promise<void> snapshotContainer(SnapshotContainerContext context) override;
   kj::Promise<void> inspect(InspectContext context) override;
+  kj::Promise<void> setLabels(SetLabelsContext context) override;
 
   kj::Own<ContainerClient> addRef();
 
@@ -245,6 +246,17 @@ class ContainerClient final: public rpc::Container::Server, public kj::Refcounte
   std::atomic_bool containerSidecarStarted = false;
   std::atomic_bool egressListenerStarted = false;
   std::atomic_bool caCertInjected = false;
+
+  // In-memory authoritative label set for this container. Populated from StartParams.labels
+  // when start() runs, and replaced wholesale by setLabels(). inspect() overlays this map
+  // on top of the Docker-derived labels: for any key present here, this value wins. Docker's
+  // HTTP API does not support runtime label mutation, so setLabels() cannot propagate to the
+  // host's `docker inspect` view; this map is the source of truth for the JS API.
+  kj::HashMap<kj::String, kj::String> currentLabels;
+
+  // Process-wide latch ensuring the "Docker does not propagate runtime label changes"
+  // warning is emitted at most once per workerd process, on the first setLabels() call.
+  std::atomic_bool setLabelsWarningLogged{false};
 
   // Writable clone volumes currently owned by the app container, or by an in-flight start()
   // that still needs failure cleanup.

@@ -1551,14 +1551,25 @@ kj::Promise<kj::Maybe<ContainerClient::InspectResponse>> ContainerClient::inspec
       for (auto field: labelsJson.getObject()) {
         kj::StringPtr name = field.getName();
         if (!name.startsWith(WORKERD_LABEL_PREFIX)) continue;
+        auto unprefixed = name.slice(WORKERD_LABEL_PREFIX.size());
+        // If currentLabels has an entry for this key, prefer it; the Docker daemon cannot
+        // observe runtime label mutations from setLabels(), so the in-memory map wins.
+        if (currentLabels.find(unprefixed) != kj::none) continue;
         auto value = field.getValue();
         JSG_REQUIRE(value.isString(), Error, "Malformed ContainerInspect label value");
         labels.add(Label{
-          .name = kj::str(name.slice(WORKERD_LABEL_PREFIX.size())),
+          .name = kj::str(unprefixed),
           .value = kj::str(value.getString()),
         });
       }
     }
+  }
+
+  for (auto& entry: currentLabels) {
+    labels.add(Label{
+      .name = kj::str(entry.key),
+      .value = kj::str(entry.value),
+    });
   }
 
   co_return InspectResponse{.isRunning = running, .labels = labels.releaseAsArray()};
@@ -2209,6 +2220,31 @@ kj::Promise<void> ContainerClient::status(StatusContext context) {
   context.getResults().setRunning(isRunning);
 }
 
+kj::Promise<void> ContainerClient::setLabels(SetLabelsContext context) {
+  auto [ready, done] = getRpcTurn();
+  co_await ready;
+  KJ_DEFER(done->fulfill());
+
+  JSG_REQUIRE(containerStarted.load(std::memory_order_acquire), Error,
+      "setLabels() requires a running container.");
+
+  auto params = context.getParams();
+  auto newLabels = params.getLabels();
+  currentLabels.clear();
+  for (auto i: kj::zeroTo(newLabels.size())) {
+    currentLabels.insert(kj::str(newLabels[i].getName()), kj::str(newLabels[i].getValue()));
+  }
+
+  if (!setLabelsWarningLogged.exchange(true, std::memory_order_acq_rel)) {
+    KJ_LOG(WARNING,
+        "setLabels() updates workerd's in-memory label state but Docker does not support "
+        "runtime label mutation; `docker inspect` on the host will not reflect these changes. "
+        "The production container runtime propagates labels correctly.");
+  }
+
+  co_return;
+}
+
 kj::Promise<void> ContainerClient::inspect(InspectContext context) {
   auto maybeResp = co_await inspectContainer();
   auto info = context.getResults().initInfo();
@@ -2246,6 +2282,16 @@ kj::Promise<void> ContainerClient::start(StartContext context) {
   }
 
   internetEnabled = params.getEnableInternet();
+
+  // Mirror the start-time labels into our in-memory authoritative set so inspect() and any
+  // subsequent setLabels() build on the same source of truth.
+  currentLabels.clear();
+  if (params.hasLabels()) {
+    auto lbls = params.getLabels();
+    for (auto i: kj::zeroTo(lbls.size())) {
+      currentLabels.insert(kj::str(lbls[i].getName()), kj::str(lbls[i].getValue()));
+    }
+  }
 
   kj::String effectiveImage = kj::str(imageName);
   if (params.hasContainerSnapshotId()) {
